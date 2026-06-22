@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.bak.switcher-*
+*.tmp.switcher
+.codex-switcher-presets.json
+*.corrupt-*
+.DS_Store
