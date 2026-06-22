@@ -106,12 +106,14 @@ except ValueError:
 # 错误，把 base_url 指向本地代理（LiteLLM 等）即可，其它字段照填。
 # ---------------------------------------------------------------------------
 DEFAULT_PRESETS = {
+    "version": 2,
     "providers": [
         {
             "id": "openai",
             "name": "OpenAI (官方默认)",
             "base_url": "",
             "model": "gpt-5.5",
+            "models": ["gpt-5.5"],
             "wire_api": "responses",
             "env_key": "",
             "storage_mode": "none",
@@ -121,7 +123,10 @@ DEFAULT_PRESETS = {
             "id": "deepseek",
             "name": "DeepSeek",
             "base_url": "https://api.deepseek.com/v1",
-            "model": "deepseek-chat",
+            "model": "deepseek-v4-pro",
+            # 现役：v4-pro(性能)/v4-flash(速度)。旧的 deepseek-chat / deepseek-reasoner
+            # 将于 2026/07/24 弃用，如仍需用可在编辑框手动添加。
+            "models": ["deepseek-v4-pro", "deepseek-v4-flash"],
             "wire_api": "responses",
             "env_key": "DEEPSEEK_API_KEY",
             "storage_mode": "inline",
@@ -131,7 +136,8 @@ DEFAULT_PRESETS = {
             "id": "kimi",
             "name": "Kimi (Moonshot)",
             "base_url": "https://api.moonshot.cn/v1",
-            "model": "kimi-k2-0905-preview",
+            "model": "kimi-k2.7-code",
+            "models": ["kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6", "kimi-k2.5", "moonshot-v1-128k"],
             "wire_api": "responses",
             "env_key": "MOONSHOT_API_KEY",
             "storage_mode": "inline",
@@ -142,6 +148,7 @@ DEFAULT_PRESETS = {
             "name": "智谱 GLM",
             "base_url": "https://open.bigmodel.cn/api/paas/v4",
             "model": "glm-4.6",
+            "models": ["glm-4.6", "glm-4.7", "glm-5", "glm-5.1", "glm-5.2"],
             "wire_api": "responses",
             "env_key": "ZHIPUAI_API_KEY",
             "storage_mode": "inline",
@@ -149,6 +156,9 @@ DEFAULT_PRESETS = {
         },
     ]
 }
+
+# 预设结构版本：用于把旧 presets.json 迁移到带 models 列表的新结构
+PRESETS_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +175,30 @@ def _atomic_write(path, text, mode=0o600):
     os.replace(tmp, path)
 
 
+def migrate_presets(data):
+    """把旧结构迁移到带 models 列表的新结构；刷新已知预设的模型名。"""
+    changed = False
+    for p in data["providers"]:
+        if not isinstance(p.get("models"), list) or not p.get("models"):
+            p["models"] = [p["model"]] if p.get("model") else []
+            changed = True
+    if data.get("version", 0) < PRESETS_VERSION:
+        defmap = {d["id"]: d for d in DEFAULT_PRESETS["providers"]}
+        for p in data["providers"]:
+            d = defmap.get(p.get("id"))
+            if d:
+                # 刷新已知预设(deepseek/kimi/glm/openai)的模型列表；保留用户的 name/base_url/env_key/密钥
+                p["models"] = list(d["models"])
+                if p.get("model") not in d["models"]:
+                    p["model"] = d["model"]
+                changed = True
+        data["version"] = PRESETS_VERSION
+        changed = True
+    if changed:
+        save_presets(data)
+    return data
+
+
 def load_presets():
     if not os.path.exists(PRESETS_PATH):
         save_presets(DEFAULT_PRESETS)
@@ -174,7 +208,7 @@ def load_presets():
             data = json.load(f)
         if not isinstance(data, dict) or not isinstance(data.get("providers"), list):
             raise ValueError("bad presets")
-        return data
+        return migrate_presets(data)
     except Exception:
         # 损坏：另存一份再回退默认，避免静默丢失用户自定义 provider
         try:
@@ -445,11 +479,16 @@ def get_state():
         model = p.get("model", "")
         if pid == active_provider and active_model:
             model = active_model
+        models = p.get("models") or ([p["model"]] if p.get("model") else [])
+        # 当前激活的真实 model 若不在列表里，补进去，方便下拉显示
+        if model and model not in models:
+            models = [model] + models
         item = {
             "id": pid,
             "name": (block.get("name") if block else "") or p.get("name", pid),
             "base_url": (block.get("base_url") if block else "") or p.get("base_url", ""),
             "model": model,
+            "models": models,
             "wire_api": (block.get("wire_api") if block else "") or p.get("wire_api", "responses"),
             "env_key": (block.get("env_key") if block else "") or p.get("env_key", ""),
             "storage_mode": p.get("storage_mode", "inline"),
@@ -470,7 +509,7 @@ def get_state():
     }
 
 
-def do_switch(pid):
+def do_switch(pid, model=None):
     presets = load_presets()
     preset = next((x for x in presets["providers"] if x.get("id") == pid), None)
     if not preset:
@@ -483,11 +522,18 @@ def do_switch(pid):
             return False, "provider「%s」还没配置好（缺 base_url）。请先点编辑保存。" % name
         if not (block.get("experimental_bearer_token") or block.get("env_key")):
             return False, "provider「%s」缺少密钥，请先编辑填写 API Key 或环境变量名。" % name
-        if not preset.get("model"):
-            return False, "provider「%s」未设置 model，请先编辑填写。" % name
+    # 选定的 model：优先用前端传来的；否则用预设默认
+    chosen = (model or "").strip() or preset.get("model") or read_active(lines)[0] or "gpt-5.5"
+    if not chosen:
+        return False, "provider「%s」未设置 model，请先编辑填写。" % name
+    # 记住这次选择，作为该 provider 下次默认
+    if chosen != preset.get("model"):
+        preset["model"] = chosen
+        if chosen not in (preset.get("models") or []):
+            preset["models"] = [chosen] + list(preset.get("models") or [])
+        save_presets(presets)
     lines = set_root_key(lines, "model_provider", pid)
-    model = preset.get("model") or read_active(lines)[0] or "gpt-5.5"
-    lines = set_root_key(lines, "model", model)
+    lines = set_root_key(lines, "model", chosen)
     backup = write_config_lines(lines)
     return True, backup
 
@@ -498,11 +544,24 @@ def do_save_provider(payload):
         return False, "provider id 只能含字母/数字/下划线/连字符"
     if pid in RESERVED_IDS:
         return False, "「%s」是 Codex 保留的内置 id，请换一个" % pid
+    # 模型列表：前端可传 models 数组；兼容只传单个 model
+    raw_models = payload.get("models")
+    if isinstance(raw_models, list):
+        models = [str(m).strip() for m in raw_models if str(m).strip()]
+    else:
+        models = []
+    single = (payload.get("model") or "").strip()
+    if single and single not in models:
+        models = [single] + models
+    # 去重保序
+    seen = set()
+    models = [m for m in models if not (m in seen or seen.add(m))]
     rec = {
         "id": pid,
         "name": (payload.get("name") or pid).strip(),
         "base_url": (payload.get("base_url") or "").strip(),
-        "model": (payload.get("model") or "").strip(),
+        "model": single or (models[0] if models else ""),
+        "models": models,
         "wire_api": (payload.get("wire_api") or "responses").strip(),
         "env_key": (payload.get("env_key") or "").strip(),
         "storage_mode": payload.get("storage_mode") or "inline",
@@ -510,8 +569,10 @@ def do_save_provider(payload):
     }
     if not rec["base_url"]:
         return False, "base_url 不能为空"
+    if not models:
+        return False, "至少填写一个 model"
     if not rec["model"]:
-        return False, "model 不能为空"
+        rec["model"] = models[0]
     if rec["storage_mode"] == "env" and not rec["env_key"]:
         return False, "环境变量模式需要填写环境变量名。"
 
@@ -638,8 +699,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .dlg-b{padding:16px 18px;max-height:70vh;overflow:auto}
   .dlg-f{padding:14px 18px;border-top:1px solid var(--line);display:flex;justify-content:flex-end;gap:8px}
   label{display:block;font-size:12px;color:var(--mut);margin:12px 0 4px}
-  input,select{width:100%;background:var(--card2);border:1px solid var(--line);
+  input,select,textarea{width:100%;background:var(--card2);border:1px solid var(--line);
     color:var(--txt);border-radius:8px;padding:8px 10px;font:inherit}
+  textarea{resize:vertical;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+  select.modelsel{width:auto;display:inline-block;padding:3px 6px;font-size:12px;
+    max-width:60%;vertical-align:middle}
   .hint{font-size:11px;color:var(--mut);margin-top:4px}
   .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);
     background:#11241d;border:1px solid #23694f;color:#aef0d6;padding:10px 16px;
@@ -681,8 +745,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <input id="f_name" placeholder="DeepSeek">
     <label>base_url（直连填官方端点；走代理填本地代理地址）</label>
     <input id="f_base" placeholder="https://api.deepseek.com/v1">
-    <label>model（默认使用的模型 id）</label>
-    <input id="f_model" placeholder="deepseek-chat">
+    <label>模型 models（每行一个，可填多个；第一行为默认）</label>
+    <textarea id="f_models" rows="4" placeholder="deepseek-v4-pro&#10;deepseek-v4-flash"></textarea>
+    <div class="hint">在卡片上可用下拉随时切换这些模型。</div>
     <label>wire_api</label>
     <select id="f_wire">
       <option value="responses">responses（新版唯一支持；直连或经兼容代理）</option>
@@ -747,12 +812,23 @@ function render(){
     div.innerHTML=
       '<h3>'+esc(p.name)+' '+badge+(cur?' <span class="pill">使用中</span>':'')+'</h3>'+
       '<div class="meta">id: '+esc(p.id)+'</div>'+
-      (p.base_url?'<div class="meta">base_url: '+esc(p.base_url)+'</div>':'')+
-      '<div class="meta">model: '+esc(p.model||'-')+'</div>'+
-      '<div class="row"></div>';
-    const row=div.querySelector('.row');
-    const bSwitch=mkbtn('切到这个','primary',()=>switchTo(p.id));
-    bSwitch.disabled=cur; row.appendChild(bSwitch);
+      (p.base_url?'<div class="meta">base_url: '+esc(p.base_url)+'</div>':'');
+    // model 行：多个模型用下拉，单个用文本
+    const mrow=document.createElement('div');mrow.className='meta';
+    let sel=null;
+    const models=p.models&&p.models.length?p.models:(p.model?[p.model]:[]);
+    if(models.length>1){
+      mrow.appendChild(document.createTextNode('model: '));
+      sel=document.createElement('select');sel.className='modelsel';
+      for(const m of models){const o=document.createElement('option');o.value=m;o.textContent=m;
+        if(m===p.model)o.selected=true;sel.appendChild(o);}
+      mrow.appendChild(sel);
+    }else{mrow.textContent='model: '+(p.model||'-');}
+    div.appendChild(mrow);
+    const row=document.createElement('div');row.className='row';div.appendChild(row);
+    const label=cur?'应用所选模型':'切到这个';
+    const bSwitch=mkbtn(label,'primary',()=>switchTo(p.id,sel?sel.value:null));
+    row.appendChild(bSwitch);
     if(!p.builtin){
       row.appendChild(mkbtn('编辑','',()=>openEdit(p.id)));
       row.appendChild(mkbtn('删除','danger',()=>del(p.id)));
@@ -763,8 +839,8 @@ function render(){
 function mkbtn(text,cls,fn){const b=document.createElement('button');
   b.textContent=text;if(cls)b.className=cls;b.addEventListener('click',fn);return b;}
 function esc(s){return (s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-async function switchTo(id){const r=await api('/api/switch',{id});
-  if(r.ok){toast('已切换到 '+id+'（开新会话生效）');load();}else{toast(r.error||'失败',true);}}
+async function switchTo(id,model){const r=await api('/api/switch',{id,model});
+  if(r.ok){toast('已切到 '+id+(model?(' / '+model):'')+'（开新会话生效）');load();}else{toast(r.error||'失败',true);}}
 async function del(id){if(!confirm('删除 provider「'+id+'」？会移除 config 里对应的块。'))return;
   const r=await api('/api/delete-provider',{id});if(r.ok){toast('已删除');load();}else{toast(r.error||'失败',true);}}
 function onMode(){const m=document.getElementById('f_mode').value;
@@ -781,7 +857,8 @@ function openEdit(id){
   document.getElementById('f_id').readOnly=!!p;
   document.getElementById('f_name').value=p?p.name:'';
   document.getElementById('f_base').value=p?p.base_url:'';
-  document.getElementById('f_model').value=p?p.model:'';
+  const models=p?(p.models&&p.models.length?p.models:(p.model?[p.model]:[])):[];
+  document.getElementById('f_models').value=models.join('\n');
   document.getElementById('f_wire').value=p?(p.wire_api||'responses'):'responses';
   document.getElementById('f_mode').value=p?(p.storage_mode||'inline'):'inline';
   document.getElementById('f_key').value='';
@@ -793,11 +870,13 @@ function openEdit(id){
   openDlg();
 }
 async function saveProvider(){
+  const models=document.getElementById('f_models').value.split('\n').map(s=>s.trim()).filter(Boolean);
   const body={
     id:document.getElementById('f_id').value.trim(),
     name:document.getElementById('f_name').value.trim(),
     base_url:document.getElementById('f_base').value.trim(),
-    model:document.getElementById('f_model').value.trim(),
+    models:models,
+    model:models[0]||'',
     wire_api:document.getElementById('f_wire').value,
     storage_mode:document.getElementById('f_mode').value,
     api_key:document.getElementById('f_key').value.trim(),
@@ -897,7 +976,7 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_body()
             with _LOCK:
                 if path == "/api/switch":
-                    ok, info = do_switch(body.get("id"))
+                    ok, info = do_switch(body.get("id"), body.get("model"))
                 elif path == "/api/save-provider":
                     ok, info = do_save_provider(body)
                 elif path == "/api/delete-provider":
